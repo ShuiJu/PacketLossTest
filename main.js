@@ -18,7 +18,10 @@ var TestEngine = class {
     this.isCleanedUp = false;
     this.activeTimeouts =  new Set();
     this.lossCheckInterval = null;
+    this.serverStatsPollInterval = null;
+    this.serverStatsInFlight = false;
     this.pcId = null;
+    this.completingTest = false;
     this.connectionTimeoutId = null;
     this.wasDisconnected = false;
     this.reconnectAttempt = 0;
@@ -30,7 +33,8 @@ var TestEngine = class {
     this.BUFFER_LOW_WATERMARK = 8 * 1024 * 1024;
     this.sendingComplete = false;
     this.sendingCompleteTime = null;
-    this.GRACE_PERIOD_MS = 3e3;
+    this.GRACE_PERIOD_MS = 6e3;
+    this.C2S_LOSS_SETTLE_MS = 5e3;
     this.stats = {
       sent: 0,
       received: 0,
@@ -45,7 +49,13 @@ var TestEngine = class {
       receivedPPS: 0,
       outOfOrder: 0,
       outOfOrderPercent: 0,
-      rtt: 0
+      rtt: 0,
+      latencyAvg: 0,
+      latencyOnePercentMax: 0,
+      latencyMax: 0,
+      jitterAvg: 0,
+      jitterOnePercentMax: 0,
+      jitterMax: 0
     };
     this.ppsWindow = 1e3;
     this.lastPPSUpdate = 0;
@@ -69,6 +79,13 @@ var TestEngine = class {
     this.MIN_TIMEOUT = 1e3;
     this.rttHistory = [];
     this.jitterHistory = [];
+    this.latencySamples = [];
+    this.jitterSamples = [];
+    this.latencyTotal = 0;
+    this.jitterTotal = 0;
+    this.latencyMax = 0;
+    this.jitterMax = 0;
+    this.lastTimingStatsUpdate = 0;
     this.displayRTT = 0;
     this.displayJitter = 0;
     this.autoIntervalEnabled = false;
@@ -145,6 +162,97 @@ var TestEngine = class {
     const average = sum / history.length;
     return round ? Math.round(average) : average;
   }
+
+  calculateOnePercentMax(samples) {
+    if (!samples || samples.length === 0) return 0;
+    const sampleCount = Math.max(1, Math.ceil(samples.length * 0.01));
+    const worstSamples = [...samples].sort((a, b) => b - a).slice(0, sampleCount);
+    const sum = worstSamples.reduce((acc, val) => acc + val, 0);
+    return sum / worstSamples.length;
+  }
+
+  updateTimingSummary(force = false) {
+    const now = Date.now();
+    const refreshInterval = this.latencySamples.length > 1e4 ? 1e3 : 250;
+    if (!force && now - this.lastTimingStatsUpdate < refreshInterval && this.latencySamples.length > 2) {
+      return;
+    }
+    this.lastTimingStatsUpdate = now;
+    this.stats.latencyAvg = this.latencySamples.length > 0 ? this.latencyTotal / this.latencySamples.length : 0;
+    this.stats.latencyOnePercentMax = this.calculateOnePercentMax(this.latencySamples);
+    this.stats.latencyMax = this.latencyMax;
+    this.stats.jitterAvg = this.jitterSamples.length > 0 ? this.jitterTotal / this.jitterSamples.length : 0;
+    this.stats.jitterOnePercentMax = this.calculateOnePercentMax(this.jitterSamples);
+    this.stats.jitterMax = this.jitterMax;
+  }
+
+  recordTimingSample(measuredRTT, jitterSample = null) {
+    if (Number.isFinite(measuredRTT) && measuredRTT >= 0) {
+      this.latencySamples.push(measuredRTT);
+      this.latencyTotal += measuredRTT;
+      this.latencyMax = Math.max(this.latencyMax, measuredRTT);
+    }
+    if (Number.isFinite(jitterSample) && jitterSample >= 0) {
+      this.jitterSamples.push(jitterSample);
+      this.jitterTotal += jitterSample;
+      this.jitterMax = Math.max(this.jitterMax, jitterSample);
+    }
+    this.updateTimingSummary();
+  }
+
+  applyServerRxCount(serverRxCount) {
+    if (!Number.isFinite(serverRxCount) || serverRxCount <= this.serverRxCount) {
+      return;
+    }
+    const newConfirmations = serverRxCount - this.serverRxCount;
+    this.serverRxCount = serverRxCount;
+    if (this.testRunning && newConfirmations > 0) {
+      this.emit("packet:sent", { count: newConfirmations, type: "c2s" });
+    }
+  }
+
+  async refreshServerStats() {
+    if (!this.pcId || (this.serverStatsInFlight && this.testRunning)) {
+      return;
+    }
+    const pcId = this.pcId;
+    this.serverStatsInFlight = true;
+    try {
+      const response = await fetch(getServerUrl(`/webrtc/stats/${encodeURIComponent(pcId)}`), {
+        cache: "no-store"
+      });
+      if (!response.ok || this.pcId !== pcId || this.isCleanedUp) {
+        return;
+      }
+      const stats = await response.json();
+      this.applyServerRxCount(Number(stats.server_rx_count));
+    } catch (e) {
+    } finally {
+      this.serverStatsInFlight = false;
+    }
+  }
+
+  startServerStatsPolling() {
+    if (this.serverStatsPollInterval || !this.pcId) {
+      return;
+    }
+    this.refreshServerStats();
+    this.serverStatsPollInterval = setInterval(() => {
+      if (!this.testRunning || this.isCleanedUp) {
+        this.stopServerStatsPolling();
+        return;
+      }
+      this.refreshServerStats();
+    }, 500);
+  }
+
+  stopServerStatsPolling() {
+    if (this.serverStatsPollInterval) {
+      clearInterval(this.serverStatsPollInterval);
+      this.serverStatsPollInterval = null;
+    }
+  }
+
   calculatePPS() {
     if (!this.testRunning) {
       return;
@@ -250,23 +358,9 @@ var TestEngine = class {
     const deltaSent = newest.sent - oldest.sent;
     const deltaServerRx = newest.serverRxCount - oldest.serverRxCount;
     const deltaReceived = newest.received - oldest.received;
-    const inFlightWindow = this.getAdaptiveTimeout();
-    const currentTime = Date.now();
-    let inFlight = 0;
-    for (const seq in this.packets) {
-      const packet = this.packets[seq];
-      if (packet.sent < windowStart) {
-        delete this.packets[seq];
-        continue;
-      }
-      const packetAge = currentTime - packet.sent;
-      if (packetAge >= inFlightWindow) continue;
-      if (!packet.received) {
-        inFlight++;
-      }
-    }
-    const windowC2SLosses = Math.max(0, deltaSent - deltaServerRx - inFlight);
-    const windowS2CLosses = Math.max(0, deltaServerRx - deltaReceived);
+    const { c2sPending, s2cPending } = this.calculatePendingPackets(windowStart);
+    const windowC2SLosses = Math.max(0, deltaSent - deltaServerRx - c2sPending);
+    const windowS2CLosses = Math.max(0, deltaServerRx - deltaReceived - Math.min(s2cPending, Math.max(0, deltaServerRx - deltaReceived)));
     let c2sLossRate = 0;
     let s2cLossRate = 0;
     if (deltaSent > 0) {
@@ -276,8 +370,8 @@ var TestEngine = class {
     const totalSent = this.stats.sent - this.baselineStats.sent;
     const totalServerRx = this.serverRxCount - this.baselineStats.serverRxCount;
     const totalReceived = this.stats.received - this.baselineStats.received;
-    const totalC2SLosses = Math.max(0, totalSent - totalServerRx - inFlight) + (this.baselineStats.priorC2SLost || 0);
-    const totalS2CLosses = Math.max(0, totalServerRx - totalReceived) + (this.baselineStats.priorS2CLost || 0);
+    const totalC2SLosses = Math.max(0, totalSent - totalServerRx - c2sPending) + (this.baselineStats.priorC2SLost || 0);
+    const totalS2CLosses = Math.max(0, totalServerRx - totalReceived - Math.min(s2cPending, Math.max(0, totalServerRx - totalReceived))) + (this.baselineStats.priorS2CLost || 0);
     this.stats.c2sLost = Math.max(this.stats.c2sLost, totalC2SLosses);
     this.stats.s2cLost = Math.max(this.stats.s2cLost, totalS2CLosses);
     this.stats.lost = this.stats.c2sLost + this.stats.s2cLost;
@@ -306,23 +400,12 @@ var TestEngine = class {
       this.calculateRealtimeLoss();
       return;
     }
-    const inFlightWindow = this.getAdaptiveTimeout();
-    const currentTime = Date.now();
-    let inFlight = 0;
-    for (const seq in this.packets) {
-      if (seq < this.baselineStats.sent) continue;
-      const packet = this.packets[seq];
-      const packetAge = currentTime - packet.sent;
-      if (packetAge >= inFlightWindow) continue;
-      if (!packet.received) {
-        inFlight++;
-      }
-    }
+    const { c2sPending, s2cPending } = this.calculatePendingPackets();
     const deltaSent = this.stats.sent - this.baselineStats.sent;
     const deltaServerRx = this.serverRxCount - this.baselineStats.serverRxCount;
     const deltaReceived = this.stats.received - this.baselineStats.received;
-    const currentC2SLosses = Math.max(0, deltaSent - deltaServerRx - inFlight);
-    const currentS2CLosses = Math.max(0, deltaServerRx - deltaReceived);
+    const currentC2SLosses = Math.max(0, deltaSent - deltaServerRx - c2sPending);
+    const currentS2CLosses = Math.max(0, deltaServerRx - deltaReceived - Math.min(s2cPending, Math.max(0, deltaServerRx - deltaReceived)));
     let c2sLossRate = 0;
     let s2cLossRate = 0;
     if (deltaSent > 0) {
@@ -350,11 +433,51 @@ var TestEngine = class {
     return Math.max(this.MIN_TIMEOUT, Math.min(adaptiveTimeout, this.BOOTSTRAP_TIMEOUT));
   }
 
+  getC2SLossSettleWindow() {
+    return Math.max(this.C2S_LOSS_SETTLE_MS, this.getAdaptiveTimeout() + 1e3, this.GRACE_PERIOD_MS + 2e3);
+  }
+
+  calculatePendingPackets(windowStart = null) {
+    const currentTime = Date.now();
+    const c2sSettleWindow = this.getC2SLossSettleWindow();
+    const s2cSettleWindow = this.getAdaptiveTimeout();
+    let c2sPending = 0;
+    let s2cPending = 0;
+
+    for (const seq in this.packets) {
+      const packet = this.packets[seq];
+      if (windowStart !== null && packet.sent < windowStart) {
+        delete this.packets[seq];
+        continue;
+      }
+      if (Number(seq) < this.baselineStats.sent) continue;
+
+      const packetAge = currentTime - packet.sent;
+      if (!packet.received && packetAge < c2sSettleWindow) {
+        c2sPending++;
+      }
+      if (!packet.received && packetAge < s2cSettleWindow) {
+        s2cPending++;
+      }
+
+      // Clean up old packets past the settle window in cumulative mode
+      // (realtime mode handles cleanup via windowStart above)
+      if (windowStart === null && !packet.received && packet.timedOut && packetAge > Math.max(c2sSettleWindow, s2cSettleWindow) + 5000) {
+        delete this.packets[seq];
+      } else if (windowStart === null && packet.received && packetAge > c2sSettleWindow) {
+        delete this.packets[seq];
+      }
+    }
+
+    return { c2sPending, s2cPending };
+  }
+
 
   updateRTT(measuredRTT) {
     this.rttSampleCount++;
+    let jitterSample = null;
     if (this.lastRTT !== null) {
-      const jitterSample = Math.abs(measuredRTT - this.lastRTT);
+      jitterSample = Math.abs(measuredRTT - this.lastRTT);
       this.stats.jitter += (jitterSample - this.stats.jitter) / 16;
     }
     this.lastRTT = measuredRTT;
@@ -374,6 +497,7 @@ var TestEngine = class {
     this.trimHistory(this.jitterHistory, this.SMA_WINDOW_SIZE);
     this.displayRTT = this.calculateSMA(this.rttHistory, false);
     this.displayJitter = this.calculateSMA(this.jitterHistory, false);
+    this.recordTimingSample(measuredRTT, jitterSample);
     if (this.rttSampleCount === this.BOOTSTRAP_PACKETS) {
       if (this.autoIntervalEnabled && !this.autoIntervalAdjusted) {
         this.adjustPacketInterval();
@@ -464,12 +588,20 @@ var TestEngine = class {
     this.lastIntervalAdjustmentTime = Date.now();
   }
 
-  completeTest() {
-    if (!this.testRunning || this.isCleanedUp) {
+  async completeTest() {
+    if (!this.testRunning || this.isCleanedUp || this.completingTest) {
       return;
     }
+    this.completingTest = true;
     this.testRunning = false;
+    if (this.sendInterval) {
+      clearInterval(this.sendInterval);
+      this.sendInterval = null;
+    }
+    this.stopServerStatsPolling();
+    await this.refreshServerStats();
     this.calculateLossStats();
+    this.updateTimingSummary(true);
     this.stats.rtt = this.displayRTT || 0;
     this.stats.jitter = this.displayJitter || 0;
     const finalStats = {
@@ -627,7 +759,14 @@ var TestEngine = class {
       sentPPS: 0,
       receivedPPS: 0,
       outOfOrder: 0,
-      outOfOrderPercent: 0
+      outOfOrderPercent: 0,
+      rtt: 0,
+      latencyAvg: 0,
+      latencyOnePercentMax: 0,
+      latencyMax: 0,
+      jitterAvg: 0,
+      jitterOnePercentMax: 0,
+      jitterMax: 0
     };
     this.serverRxCount = 0;
     this.lastPPSUpdate = Date.now();
@@ -644,6 +783,13 @@ var TestEngine = class {
     this.lastRTT = null;
     this.rttHistory = [];
     this.jitterHistory = [];
+    this.latencySamples = [];
+    this.jitterSamples = [];
+    this.latencyTotal = 0;
+    this.jitterTotal = 0;
+    this.latencyMax = 0;
+    this.jitterMax = 0;
+    this.lastTimingStatsUpdate = 0;
     this.displayRTT = 0;
     this.displayJitter = 0;
     this.testStartTime = Date.now();
@@ -711,6 +857,7 @@ var TestEngine = class {
       const answer = await response.json();
       this.pcId = answer.pc_id;
       await this.pc.setRemoteDescription(new RTCSessionDescription(answer.sdp));
+      this.startServerStatsPolling();
       this.emit("status", { message: "Handshake complete" });
       this.emit("status", { message: "Starting test" });
     } catch (e) {
@@ -771,7 +918,7 @@ var TestEngine = class {
         });
       }, 200);
       if (testDuration !== Infinity && isFinite(testDuration)) {
-        const fallbackTimeMs = testDuration * 1e3 + this.BOOTSTRAP_TIMEOUT;
+        const fallbackTimeMs = testDuration * 1e3 + Math.max(this.BOOTSTRAP_TIMEOUT, this.GRACE_PERIOD_MS);
         const fallbackTimerId = setTimeout(() => {
           if (this.testRunning && !this.isCleanedUp) {
             this.completeTest();
@@ -795,13 +942,7 @@ var TestEngine = class {
         if (textData) {
           const data = JSON.parse(textData);
           if (data.s_rx !== void 0) {
-            if (data.s_rx > this.serverRxCount) {
-              const newConfirmations = data.s_rx - this.serverRxCount;
-              this.serverRxCount = data.s_rx;
-              if (this.testRunning) {
-                this.emit("packet:sent", { count: newConfirmations, type: "c2s" });
-              }
-            }
+            this.applyServerRxCount(Number(data.s_rx));
           }
           if (this.packets[data.seq] !== void 0 && !this.packets[data.seq].received) {
             this.packets[data.seq].received = true;
@@ -986,6 +1127,7 @@ var TestEngine = class {
       const answer = await response.json();
       this.pcId = answer.pc_id;
       await this.pc.setRemoteDescription(new RTCSessionDescription(answer.sdp));
+      this.startServerStatsPolling();
       this.restartSendingWithInterval(this.baseInterval);
       this.wasDisconnected = false;
       this.reconnectAttempt = 0;
@@ -1010,8 +1152,10 @@ var TestEngine = class {
   cleanup() {
     this.isCleanedUp = true;
     this.testRunning = false;
+    this.completingTest = false;
     this.wasDisconnected = false;
     this.reconnectAttempt = 0;
+    this.stopServerStatsPolling();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1061,10 +1205,10 @@ var LAYOUTS = {
     serverPos: { x: 650, y: 160 },
     pathC2S: "M 100 200 L 610 200",
     pathS2C: "M 610 120 L 100 120",
-    graphPos: { x: 130, y: 60 },
-    graphSize: { w: 450, h: 200 },
-    statsPos: { x: 130, y: 10 },
-    statsSize: { w: 450, h: 40 },
+    graphPos: { x: 130, y: 70 },
+    graphSize: { w: 450, h: 190 },
+    statsPos: { x: 130, y: 8 },
+    statsSize: { w: 450, h: 54 },
     packetStartC2S: { x: 130, y: 200 },
     packetEndC2S: { x: 580, y: 200 },
     packetStartS2C: { x: 580, y: 120 },
@@ -1073,11 +1217,11 @@ var LAYOUTS = {
   },
   VERTICAL: {
     viewBox: "0 0 360 380",
-    statsPos: { x: 30, y: 10 },
-    statsSize: { w: 300, h: 40 },
-    clientPos: { x: 180, y: 80 },
-    graphPos: { x: 50, y: 150 },
-    graphSize: { w: 280, h: 120 },
+    statsPos: { x: 30, y: 8 },
+    statsSize: { w: 300, h: 54 },
+    clientPos: { x: 180, y: 86 },
+    graphPos: { x: 50, y: 158 },
+    graphSize: { w: 280, h: 112 },
     serverPos: { x: 180, y: 330 },
     pathC2S: "M 140 100 L 140 310",
     pathS2C: "M 220 310 L 220 100",
@@ -1336,7 +1480,15 @@ var VisualizationEngine = class {
       sentPPS: 0,
       receivedPPS: 0,
       outOfOrder: 0,
-      outOfOrderPercent: 0
+      outOfOrderPercent: 0,
+      rtt: 0,
+      jitter: 0,
+      latencyAvg: 0,
+      latencyOnePercentMax: 0,
+      latencyMax: 0,
+      jitterAvg: 0,
+      jitterOnePercentMax: 0,
+      jitterMax: 0
     };
     this.currentRTT = 0;
     this.currentInterval = 0;
@@ -1704,9 +1856,9 @@ var VisualizationEngine = class {
     const startX = layout.statsPos.x;
     const startY = layout.statsPos.y;
     const statsConfig = [
-      { id: "sent", label: "Sent", color: "#4fc3f7", bg: "rgba(79, 195, 247, 0.1)" },
-      { id: "loss", label: "Total Loss", color: "#64ffda", bg: "rgba(100, 255, 218, 0.1)" },
-      { id: "lost", label: "Lost", color: "#ff5252", bg: "rgba(255, 82, 82, 0.1)" }
+      { id: "loss", label: "Loss", color: "#64ffda", bg: "rgba(100, 255, 218, 0.1)" },
+      { id: "latency", label: "Latency", color: "#4fc3f7", bg: "rgba(79, 195, 247, 0.1)" },
+      { id: "jitter", label: "Jitter", color: "#f59e0b", bg: "rgba(245, 158, 11, 0.1)" }
     ];
     statsConfig.forEach((stat, index) => {
       const x = startX + index * (boxWidth + 10);
@@ -1721,28 +1873,92 @@ var VisualizationEngine = class {
       rect.setAttribute("class", "stat-box-rect");
       rect.setAttribute("fill", stat.bg);
       rect.setAttribute("stroke", stat.color);
-      const valText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      valText.setAttribute("x", x + boxWidth / 2);
-      valText.setAttribute("y", startY + boxHeight / 2 - 5);
-      valText.setAttribute("class", "stat-value-text");
-      valText.setAttribute("fill", stat.color);
-      valText.setAttribute("id", `svg-stat-${stat.id}`);
-      valText.textContent = stat.id === "loss" ? "0%" : "0";
-      const labelText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      labelText.setAttribute("x", x + boxWidth / 2);
-      labelText.setAttribute("y", startY + boxHeight / 2 + 12);
-      labelText.setAttribute("class", "stat-label-text");
-      labelText.textContent = stat.label;
       g.appendChild(rect);
-      g.appendChild(valText);
-      g.appendChild(labelText);
+
+      const titleText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      titleText.setAttribute("x", x + boxWidth / 2);
+      titleText.setAttribute("y", startY + 10);
+      titleText.setAttribute("class", "stat-label-text");
+      titleText.style.fontSize = "8px";
+      titleText.textContent = stat.label;
+      g.appendChild(titleText);
+
+      if (stat.id === "loss") {
+        const valText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        valText.setAttribute("x", x + boxWidth / 2);
+        valText.setAttribute("y", startY + boxHeight / 2 + 2);
+        valText.setAttribute("class", "stat-value-text");
+        valText.setAttribute("fill", stat.color);
+        valText.setAttribute("id", "svg-stat-loss");
+        valText.style.fontSize = layout.vertical ? "15px" : "17px";
+        valText.textContent = "0%";
+        const detailText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        detailText.setAttribute("x", x + boxWidth / 2);
+        detailText.setAttribute("y", startY + boxHeight - 8);
+        detailText.setAttribute("class", "stat-label-text");
+        detailText.setAttribute("id", "svg-stat-loss-detail");
+        detailText.style.fontSize = layout.vertical ? "6.5px" : "7.5px";
+        detailText.style.letterSpacing = "0";
+        detailText.textContent = "0 / 0 lost";
+        g.appendChild(valText);
+        g.appendChild(detailText);
+      } else {
+        const rows = [
+          { key: "avg", label: "AVG" },
+          { key: "one-percent-max", label: "1% MAX" },
+          { key: "max", label: "MAX" }
+        ];
+        rows.forEach((row, rowIndex) => {
+          const rowY = startY + 22 + rowIndex * 11;
+          const labelText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          labelText.setAttribute("x", x + 8);
+          labelText.setAttribute("y", rowY);
+          labelText.setAttribute("text-anchor", "start");
+          labelText.setAttribute("dominant-baseline", "middle");
+          labelText.setAttribute("fill", "#9ca3af");
+          labelText.style.fontSize = layout.vertical ? "6.5px" : "7.5px";
+          labelText.style.fontWeight = "600";
+          labelText.textContent = row.label;
+
+          const valueText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          valueText.setAttribute("x", x + boxWidth - 8);
+          valueText.setAttribute("y", rowY);
+          valueText.setAttribute("text-anchor", "end");
+          valueText.setAttribute("dominant-baseline", "middle");
+          valueText.setAttribute("fill", stat.color);
+          valueText.setAttribute("id", `svg-stat-${stat.id}-${row.key}`);
+          valueText.style.fontSize = layout.vertical ? "7px" : "8px";
+          valueText.style.fontWeight = "700";
+          valueText.textContent = "0.0ms";
+          g.appendChild(labelText);
+          g.appendChild(valueText);
+        });
+      }
       this.dom.statsGroup.appendChild(g);
     });
   }
+
+  formatCount(value) {
+    const safeValue = Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+    return safeValue.toLocaleString();
+  }
+
+  formatMs(value) {
+    const safeValue = Number.isFinite(value) && value > 0 ? value : 0;
+    if (safeValue >= 100) {
+      return `${Math.round(safeValue)}ms`;
+    }
+    return `${safeValue.toFixed(1)}ms`;
+  }
+
+  setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  }
+
   updateStatsUI() {
-    const elSent = document.getElementById("svg-stat-sent");
     const elLoss = document.getElementById("svg-stat-loss");
-    const elLost = document.getElementById("svg-stat-lost");
+    const elLossDetail = document.getElementById("svg-stat-loss-detail");
     let smoothedC2SLoss, smoothedS2CLoss;
     const c2sLoss = this.stats.sent >= 20 ? this.stats.c2sLossPercent || 0 : 0;
     const s2cLoss = this.stats.sent >= 20 ? this.stats.s2cLossPercent || 0 : 0;
@@ -1773,22 +1989,21 @@ var VisualizationEngine = class {
     } else if (this.direction === "s2c") {
       this.stats.currentLoss = smoothedS2CLoss;
     }
-    if (elSent) {
-      if (this.direction === "s2c") {
-        elSent.textContent = this.calculationMode === "realtime" ? this.stats.windowServerRx ?? 0 : this.stats.serverRxCount ?? 0;
-      } else {
-        elSent.textContent = this.calculationMode === "realtime" ? this.stats.windowSent ?? 0 : this.stats.sent;
-      }
-    }
     const isNegligibleLoss = !this.testCompleted && this.stats.currentLoss < 0.01;
-    if (elLost) {
-      if (this.direction === "c2s") {
-        elLost.textContent = this.calculationMode === "realtime" ? this.stats.windowC2SLost ?? 0 : this.stats.c2sLost ?? 0;
-      } else if (this.direction === "s2c") {
-        elLost.textContent = this.calculationMode === "realtime" ? this.stats.windowS2CLost ?? 0 : this.stats.s2cLost ?? 0;
-      } else {
-        elLost.textContent = this.calculationMode === "realtime" ? this.stats.windowLost ?? 0 : this.stats.lost;
-      }
+    let sentCount;
+    let lostCount;
+    if (this.direction === "s2c") {
+      sentCount = this.calculationMode === "realtime" ? this.stats.windowServerRx ?? 0 : this.stats.serverRxCount ?? 0;
+      lostCount = this.calculationMode === "realtime" ? this.stats.windowS2CLost ?? 0 : this.stats.s2cLost ?? 0;
+    } else if (this.direction === "c2s") {
+      sentCount = this.calculationMode === "realtime" ? this.stats.windowSent ?? 0 : this.stats.sent;
+      lostCount = this.calculationMode === "realtime" ? this.stats.windowC2SLost ?? 0 : this.stats.c2sLost ?? 0;
+    } else {
+      sentCount = this.calculationMode === "realtime" ? this.stats.windowSent ?? 0 : this.stats.sent;
+      lostCount = this.calculationMode === "realtime" ? this.stats.windowLost ?? 0 : this.stats.lost;
+    }
+    if (elLossDetail) {
+      elLossDetail.textContent = `${this.formatCount(lostCount)} / ${this.formatCount(sentCount)} lost`;
     }
     if (elLoss) {
       const displayLoss = isNegligibleLoss ? 0 : this.stats.currentLoss;
@@ -1800,6 +2015,12 @@ var VisualizationEngine = class {
         elLoss.setAttribute("fill", "var(--text-color)");
       }
     }
+    this.setText("svg-stat-latency-avg", this.formatMs(this.stats.latencyAvg ?? this.currentRTT));
+    this.setText("svg-stat-latency-one-percent-max", this.formatMs(this.stats.latencyOnePercentMax ?? this.currentRTT));
+    this.setText("svg-stat-latency-max", this.formatMs(this.stats.latencyMax ?? this.currentRTT));
+    this.setText("svg-stat-jitter-avg", this.formatMs(this.stats.jitterAvg ?? this.currentJitter));
+    this.setText("svg-stat-jitter-one-percent-max", this.formatMs(this.stats.jitterOnePercentMax ?? this.currentJitter));
+    this.setText("svg-stat-jitter-max", this.formatMs(this.stats.jitterMax ?? this.currentJitter));
     this.updateDirectionalLossLabels(smoothedC2SLoss, smoothedS2CLoss);
   }
   updateNetworkLabels() {
@@ -2401,7 +2622,7 @@ testEngine.on("test:disconnected", (data) => visualEngine.onDisconnected(data));
 testEngine.on("test:reconnected", (data) => visualEngine.onReconnected(data));
 testEngine.on("interval:adjusted", (data) => {
 });
-var SETTINGS_VERSION = 3;
+var SETTINGS_VERSION = 4;
 var testSettings = {
   version: SETTINGS_VERSION,
   preset: "default",
@@ -2409,7 +2630,7 @@ var testSettings = {
   direction: "both",
   packetInterval: 15.625,
   packetCount: 1920,
-  packetSize: 100,
+  packetSize: 800,
 
   autoInterval: true,
 
@@ -2868,6 +3089,9 @@ function restoreSettings() {
     root.querySelectorAll(".preset-btn").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.preset === testSettings.preset);
     });
+    root.querySelectorAll(".size-preset-btn").forEach((btn) => {
+      btn.classList.toggle("active", parseInt(btn.dataset.size) === testSettings.packetSize);
+    });
     return;
   }
   const sanitized = sanitizeSettingsForPlatform(saved);
@@ -2980,7 +3204,7 @@ resetSettingsBtn.addEventListener("click", () => {
       direction: "both",
       packetInterval: 15.625,
       packetCount: 1920,
-      packetSize: 100,
+      packetSize: 800,
       autoInterval: true,
       showNetworkMetrics: false,
       calculationMode: null,
@@ -3003,8 +3227,10 @@ resetSettingsBtn.addEventListener("click", () => {
       autoIntervalCheckbox.checked = true;
     }
     updatePacketCountDisplay();
-    packetSize.value = "100";
-    document.querySelectorAll(".size-preset-btn").forEach((b) => b.classList.remove("active"));
+    packetSize.value = "800";
+    root.querySelectorAll(".size-preset-btn").forEach((b) => {
+      b.classList.toggle("active", parseInt(b.dataset.size) === testSettings.packetSize);
+    });
     if (showNetworkMetricsCheckbox) {
       showNetworkMetricsCheckbox.checked = false;
       visualEngine.setShowNetworkMetrics(false);
@@ -3030,6 +3256,12 @@ function handleResultsRedirect(stats) {
   resultsUrl.searchParams.set("loss", stats.currentLoss.toFixed(2));
   resultsUrl.searchParams.set("jitter", stats.jitter.toFixed(2));
   resultsUrl.searchParams.set("rtt", (stats.rtt || 0).toFixed(2));
+  resultsUrl.searchParams.set("latency_avg", (stats.latencyAvg || 0).toFixed(2));
+  resultsUrl.searchParams.set("latency_1p_max", (stats.latencyOnePercentMax || 0).toFixed(2));
+  resultsUrl.searchParams.set("latency_max", (stats.latencyMax || 0).toFixed(2));
+  resultsUrl.searchParams.set("jitter_avg", (stats.jitterAvg || 0).toFixed(2));
+  resultsUrl.searchParams.set("jitter_1p_max", (stats.jitterOnePercentMax || 0).toFixed(2));
+  resultsUrl.searchParams.set("jitter_max", (stats.jitterMax || 0).toFixed(2));
   resultsUrl.searchParams.set("c2s_loss", (stats.c2sLossPercent || 0).toFixed(2));
   resultsUrl.searchParams.set("s2c_loss", (stats.s2cLossPercent || 0).toFixed(2));
   resultsUrl.searchParams.set("ooo", (stats.outOfOrderPercent || 0).toFixed(2));
@@ -3067,6 +3299,12 @@ function initializePlatformFeatures() {
           resultsUrl.searchParams.set("loss", lastTestStats.currentLoss.toFixed(2));
           resultsUrl.searchParams.set("jitter", lastTestStats.jitter.toFixed(2));
           resultsUrl.searchParams.set("rtt", (lastTestStats.rtt || 0).toFixed(2));
+          resultsUrl.searchParams.set("latency_avg", (lastTestStats.latencyAvg || 0).toFixed(2));
+          resultsUrl.searchParams.set("latency_1p_max", (lastTestStats.latencyOnePercentMax || 0).toFixed(2));
+          resultsUrl.searchParams.set("latency_max", (lastTestStats.latencyMax || 0).toFixed(2));
+          resultsUrl.searchParams.set("jitter_avg", (lastTestStats.jitterAvg || 0).toFixed(2));
+          resultsUrl.searchParams.set("jitter_1p_max", (lastTestStats.jitterOnePercentMax || 0).toFixed(2));
+          resultsUrl.searchParams.set("jitter_max", (lastTestStats.jitterMax || 0).toFixed(2));
           resultsUrl.searchParams.set("c2s_loss", (lastTestStats.c2sLossPercent || 0).toFixed(2));
           resultsUrl.searchParams.set("s2c_loss", (lastTestStats.s2cLossPercent || 0).toFixed(2));
           resultsUrl.searchParams.set("ooo", (lastTestStats.outOfOrderPercent || 0).toFixed(2));

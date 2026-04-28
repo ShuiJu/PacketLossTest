@@ -19,9 +19,9 @@
 
 
     <!-- Local Fonts -->
-    <link rel="stylesheet" href="fonts.min.css?v=1776935747193">
+    <link rel="stylesheet" href="fonts.min.css?v=1777394092950">
     <!-- External CSS -->
-    <link rel="stylesheet" href="styles.min.css?v=1776935747193">
+    <link rel="stylesheet" href="styles.min.css?v=1777394092950">
     <style id="theme-inline-css">
         /* Standalone Reset - Only applies to index.html, not when embedded */
         html, body {
@@ -96,7 +96,7 @@
                     max: {
                         duration: PLATFORM === 'web' ? 300 : Infinity,
                         packetCount: PLATFORM === 'web' ? 6000 : Infinity,
-                        interval: 50         // ms
+                        interval: 15.625     // ms
                     }
                 }
             };
@@ -287,11 +287,12 @@
                             </div>
                             <div class="setting-group">
                                 <label class="setting-label">Packet Size (bytes) - MTU Testing</label>
-                                <input type="number" id="packet-size" value="100" min="50" max="9000" step="50"
+                                <input type="number" id="packet-size" value="800" min="50" max="9000" step="50"
                                     class="number-input">
                                 <div class="preset-buttons gap-small" style="margin-top: 8px;">
                                     <button class="size-preset-btn" data-size="100">Small (100B)</button>
                                     <button class="size-preset-btn" data-size="576">IPv4 (576B)</button>
+                                    <button class="size-preset-btn active" data-size="800">Default (800B)</button>
                                     <button class="size-preset-btn" data-size="1500">Ethernet (1500B)</button>
                                     <button class="size-preset-btn" data-size="9000">Jumbo (9000B)</button>
                                 </div>
@@ -317,7 +318,8 @@
     </div>
 
     <!-- External JavaScript Modules -->
-    <script type="module" src="bundle.min.js?v=1776935747193"></script>
+    <script src="runtime-config.js?v=1777394092950"></script>
+    <script type="module" src="bundle.min.js?v=1777394092950"></script>
 </body>
 
 </html>
